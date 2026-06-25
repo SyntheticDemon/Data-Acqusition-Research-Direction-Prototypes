@@ -1,0 +1,24 @@
+[project]
+name = "data-acqusition-research-direction-prototypes"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "SyntheticDemon",email = "pouriyatajmehrabi1381@gmail.com"}
+]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0,<3.0",
+    "pandas>=2.2,<3.0",
+    "plotly>=6.0,<7.0",
+    "scikit-learn>=1.6,<2.0",
+    "ipykernel",
+    "tqdm>=4.67,<5.0",
+    "nbformat"
+]
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

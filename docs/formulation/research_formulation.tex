@@ -1,0 +1,446 @@
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\title{Cost-Constrained Sequential Acquisition of Complete Data Batches}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study the sequential acquisition of complete supervised-learning data.
+Each acquisition obtains a batch containing both predictor variables and
+target values. Data acquisition, model retraining, and model evaluation
+consume separate resources. The system must therefore decide whether to
+acquire another batch, retrain the predictive model, evaluate the current
+model, or stop. Retraining changes both predictive performance and the utility
+assigned to future data acquisitions. We formulate this problem as a
+constrained Markov decision process and use Q-learning to learn a sequential
+policy over the four actions. We consider two treatments of resource
+constraints: hard budget constraints enforced through action masking, and
+expected constraints handled through a Lagrangian objective.
+\end{abstract}
+
+\section{Problem Setting}
+
+Let \(D^{\mathrm{train}}_0\) denote an initially available labeled training
+dataset. Let
+\[
+    \mathcal{B}_0=\{B_1,\ldots,B_M\}
+\]
+denote a collection of candidate data batches. Each batch contains complete
+supervised observations:
+\[
+    B_j=(X_j,Y_j),
+\]
+where \(X_j\) contains predictor variables and \(Y_j\) contains the
+corresponding target values.
+
+Before acquisition, the complete contents of a batch are unavailable to the
+learning system. The system may observe a low-cost preview or descriptor
+\(z_j\), such as source information, batch size, acquisition price,
+collection period, coarse feature summaries, or an unlabeled preview sample.
+Acquiring a batch reveals both \(X_j\) and \(Y_j\).
+
+The system must sequentially decide:
+\begin{enumerate}[label=(\roman*),nosep]
+    \item whether to acquire another batch;
+    \item when to retrain the model;
+    \item when to evaluate the model; and
+    \item when to stop.
+\end{enumerate}
+
+\section{Experimental Dataset}
+
+The first experiment uses the MiniBooNE Particle Identification dataset from
+the UCI Machine Learning Repository. The dataset contains 130,065
+observations, 50 continuous predictor variables, and a binary target
+distinguishing signal events from background events \cite{miniboone}.
+
+The data are partitioned into:
+\begin{itemize}[nosep]
+    \item an initially available labeled training set;
+    \item an acquisition dataset divided into candidate batches;
+    \item an evaluation set;
+    \item a hidden validation set; and
+    \item a held-out test set.
+\end{itemize}
+
+The initial training size, candidate-batch size, number of candidate batches,
+and split proportions are experimental parameters. The first prototype uses
+100 initial training records and candidate batches of 50 records.
+
+\section{Predictive Model}
+
+The predictive model is a histogram-based gradient-boosted tree classifier.
+For an observation \(x\), the model estimates
+\[
+    f_{\theta_t}(x)=P_{\theta_t}(Y=1\mid x),
+\]
+where \(\theta_t\) denotes the current model parameters.
+
+Histogram-based gradient boosting is used because it captures nonlinear
+relationships, produces class-probability estimates, trains efficiently on
+medium-sized tabular datasets, and supports repeated retraining during
+sequential experiments. Model hyperparameters are left to experimental
+selection.
+
+\section{Batch Acquisition Utility}
+
+Each candidate batch \(B_j\) has a visible descriptor or preview \(z_j\). The
+current predictive model assigns an acquisition utility
+\[
+    q_t(B_j)=g(z_j;\theta_t,m_t),
+\]
+where \(m_t\) contains the current acquisition and evaluation diagnostics.
+
+A concrete first implementation uses an unlabeled preview sample
+\(P_j\subset X_j\) and computes mean predictive entropy:
+\[
+    q_t(B_j)
+    =
+    \frac{1}{|P_j|}
+    \sum_{x\in P_j}
+    H\!\left(P_{\theta_t}(Y\mid x)\right).
+\]
+For binary classification,
+\[
+    H\!\left(P_{\theta_t}(Y\mid x)\right)
+    =
+    -p_t(x)\log p_t(x)
+    -(1-p_t(x))\log(1-p_t(x)),
+\]
+where \(p_t(x)=P_{\theta_t}(Y=1\mid x)\).
+
+The candidate batch with the highest feasible utility is selected:
+\[
+    B_t^\star
+    =
+    \arg\max_{B_j\in\mathcal{B}_t}q_t(B_j).
+\]
+Because the utility depends on \(\theta_t\), retraining changes the ranking of
+future candidate batches.
+
+\section{State}
+
+At decision step \(t\), the state is
+\[
+    s_t
+    =
+    \left(
+        D_t^{\mathrm{train}},
+        D_t^{\mathrm{pending}},
+        \mathcal{B}_t,
+        \theta_t,
+        m_t,
+        b_t
+    \right).
+\]
+
+For tabular Q-learning, this state is represented using a compact discretized
+feature vector containing:
+\begin{itemize}[nosep]
+    \item current training-set size;
+    \item pending-data size;
+    \item number of remaining candidate batches;
+    \item remaining acquisition, retraining, and evaluation budgets;
+    \item most recent evaluation score;
+    \item acquisitions since the last retraining;
+    \item retrainings since the last evaluation; and
+    \item mean and maximum candidate-batch utility.
+\end{itemize}
+Continuous variables are discretized into finite intervals.
+
+\section{Actions}
+
+The action space is
+\[
+    \mathcal{A}
+    =
+    \{\textsc{Acquire},\textsc{Retrain},\textsc{Evaluate},\textsc{Stop}\}.
+\]
+
+\subsection{Acquire}
+
+The feasible candidate batch with the highest acquisition utility is selected:
+\[
+    B_t^\star=\arg\max_{B_j\in\mathcal{B}_t}q_t(B_j).
+\]
+The complete batch is added to pending data and removed from the candidate
+collection:
+\[
+    D_{t+1}^{\mathrm{pending}}
+    =
+    D_t^{\mathrm{pending}}\cup B_t^\star,
+    \qquad
+    \mathcal{B}_{t+1}
+    =
+    \mathcal{B}_t\setminus\{B_t^\star\}.
+\]
+The model is unchanged:
+\[
+    \theta_{t+1}=\theta_t.
+\]
+
+\subsection{Retrain}
+
+All pending data are incorporated:
+\[
+    D_{t+1}^{\mathrm{train}}
+    =
+    D_t^{\mathrm{train}}\cup D_t^{\mathrm{pending}},
+    \qquad
+    D_{t+1}^{\mathrm{pending}}=\varnothing.
+\]
+The predictive model is refitted:
+\[
+    \theta_{t+1}
+    =
+    \operatorname{Train}\!\left(D_{t+1}^{\mathrm{train}}\right).
+\]
+Retraining changes predictive performance and future acquisition utilities,
+but it does not automatically reveal model performance.
+
+\subsection{Evaluate}
+
+The current model is evaluated on the designated evaluation set. The resulting
+performance statistic is added to \(m_t\) and becomes visible to the decision
+policy. Evaluation changes policy information but does not modify the model or
+training data.
+
+\subsection{Stop}
+
+The episode terminates and returns the current predictive model. Pending data
+that have not been incorporated through Retrain do not affect the terminal
+model.
+
+\section{Sequential Decision Formulation}
+
+The problem is formulated as a Markov decision process:
+\[
+    \mathcal{M}=(\mathcal{S},\mathcal{A},P,r,\gamma),
+\]
+where \(\mathcal{S}\) is the state space, \(\mathcal{A}\) is the action space,
+\(P(s_{t+1}\mid s_t,a_t)\) is the transition process, \(r_t\) is the reward,
+and \(\gamma\) is the discount factor. The policy directly chooses one of the
+four actions at every decision step:
+\[
+    a_t=\pi(s_t).
+\]
+
+\section{Q-Learning}
+
+Q-learning estimates the long-term value \(Q(s,a)\) of taking action \(a\) in
+state \(s\). After observing a transition
+\((s_t,a_t,r_t,s_{t+1})\), the corresponding value is updated as
+\[
+    Q(s_t,a_t)
+    \leftarrow
+    Q(s_t,a_t)
+    +
+    \alpha
+    \left[
+        r_t
+        +
+        \gamma\max_{a'}Q(s_{t+1},a')
+        -
+        Q(s_t,a_t)
+    \right],
+\]
+where \(\alpha\) is the learning rate and \(\gamma\) controls the importance
+of future utility.
+
+The learned policy is
+\[
+    \pi(s)=\arg\max_a Q(s,a).
+\]
+During training, exploration is introduced using an epsilon-greedy policy.
+
+\section{Reward}
+
+The primary reward is terminal predictive utility. For nonterminal actions,
+\[
+    r_t=0.
+\]
+When Stop is selected,
+\[
+    r_T=U(\theta_T),
+\]
+where \(U(\theta_T)\) is measured on the hidden validation set during policy
+development. This sparse reward allows Q-learning to propagate terminal model
+utility backward to earlier decisions.
+
+A small step penalty may optionally discourage unnecessarily long episodes,
+but acquisition, retraining, and evaluation costs are treated separately
+through constraints.
+
+\section{Cost Model}
+
+The cumulative costs are
+\[
+    C_T^{\mathrm{acq}}
+    =
+    \sum_{t<T}c_{\mathrm{acq}}(a_t,s_t),
+    \qquad
+    C_T^{\mathrm{train}}
+    =
+    \sum_{t<T}c_{\mathrm{train}}(a_t,s_t),
+\]
+and
+\[
+    C_T^{\mathrm{eval}}
+    =
+    \sum_{t<T}c_{\mathrm{eval}}(a_t,s_t).
+\]
+
+Acquisition cost may depend on batch size, source, purchase price, or
+collection difficulty. Retraining cost may depend on training-set size,
+elapsed time, memory use, processor use, or energy consumption. Evaluation
+cost may depend on evaluation-set size, delayed outcome collection, expert
+review, or computational effort.
+
+\section{Approach I: Hard Budgets with Action Masking}
+
+Let the initial budgets be
+\[
+    B_{\mathrm{acq}},\qquad B_{\mathrm{train}},\qquad B_{\mathrm{eval}}.
+\]
+The remaining budgets are included in the state:
+\[
+    b_t
+    =
+    \left(
+        b_t^{\mathrm{acq}},
+        b_t^{\mathrm{train}},
+        b_t^{\mathrm{eval}}
+    \right).
+\]
+Each resource-consuming action subtracts its cost from its corresponding
+budget.
+
+At each step, define the feasible action set:
+\[
+    \mathcal{A}_{\mathrm{feasible}}(s_t)
+    =
+    \{a\in\mathcal{A}:c(a,s_t)\leq b_t\}.
+\]
+Q-learning selects only among feasible actions:
+\[
+    a_t
+    =
+    \arg\max_{a\in\mathcal{A}_{\mathrm{feasible}}(s_t)}
+    Q(s_t,a).
+\]
+Infeasible actions are masked and cannot be selected.
+
+The optimization problem is
+\[
+    \max_\pi \mathbb{E}_\pi[U(\theta_T)]
+\]
+subject to
+\[
+    C_T^{\mathrm{acq}}\leq B_{\mathrm{acq}},
+    \qquad
+    C_T^{\mathrm{train}}\leq B_{\mathrm{train}},
+    \qquad
+    C_T^{\mathrm{eval}}\leq B_{\mathrm{eval}}.
+\]
+This approach guarantees exact budget compliance. The first prototype uses
+unit action costs and hard-budget action masking.
+
+\section{Approach II: Lagrangian Constrained Q-Learning}
+
+The second approach handles expected resource constraints using nonnegative
+Lagrange multipliers
+\(\lambda_{\mathrm{acq}},\lambda_{\mathrm{train}},\lambda_{\mathrm{eval}}\).
+The constrained objective is
+\[
+    \max_\pi\mathbb{E}_\pi[U(\theta_T)]
+\]
+subject to expected cost constraints. The modified reward is
+\[
+    r_t^\lambda
+    =
+    r_t
+    -
+    \lambda_{\mathrm{acq}}c_t^{\mathrm{acq}}
+    -
+    \lambda_{\mathrm{train}}c_t^{\mathrm{train}}
+    -
+    \lambda_{\mathrm{eval}}c_t^{\mathrm{eval}}.
+\]
+Q-learning then uses \(r_t^\lambda\).
+
+The multipliers are updated according to observed budget violations. For
+example,
+\[
+    \lambda_{\mathrm{acq}}
+    \leftarrow
+    \left[
+        \lambda_{\mathrm{acq}}
+        +
+        \eta_\lambda
+        \left(C_T^{\mathrm{acq}}-B_{\mathrm{acq}}\right)
+    \right]_+,
+\]
+with analogous updates for retraining and evaluation, where
+\([x]_+=\max(x,0)\).
+
+This approach learns a predictive-utility--cost trade-off, but it does not
+guarantee that every individual episode satisfies the budgets.
+
+\section{Comparison of Budget Approaches}
+
+Hard-budget action masking should be used when no episode may exceed the
+resource limits, costs are known before execution, and compliance must be
+guaranteed.
+
+Lagrangian constrained Q-learning should be used when constraints apply on
+average, costs may be uncertain, occasional violations are acceptable, and
+the policy should learn the utility--cost trade-off.
+
+The first experiment uses hard-budget action masking as the primary
+formulation. Lagrangian constrained Q-learning is reserved for a second
+experiment.
+
+\section{Experimental Comparison}
+
+The sequential Q-learning policy should be compared against:
+\begin{itemize}[nosep]
+    \item retraining after every acquisition;
+    \item retraining after a fixed number of acquisitions;
+    \item evaluation after every retraining;
+    \item fixed evaluation intervals;
+    \item one final retraining;
+    \item random feasible action selection;
+    \item hard-budget Q-learning; and
+    \item Lagrangian constrained Q-learning.
+\end{itemize}
+
+Reported metrics should include final test accuracy, final test AUROC, all
+three cumulative costs, numbers of acquisitions, retrainings, and evaluations,
+terminal predictive utility, and budget-violation frequency.
+
+\section{Central Research Question}
+
+\begin{quote}
+How should a learning system sequentially choose between acquiring a complete
+data batch, retraining the model, evaluating the model, and stopping, in order
+to maximize terminal predictive utility under acquisition, retraining, and
+evaluation constraints?
+\end{quote}
+
+\begin{thebibliography}{1}
+\bibitem{miniboone}
+UCI Machine Learning Repository.
+\newblock MiniBooNE Particle Identification Dataset.
+\newblock
+\url{https://archive.ics.uci.edu/dataset/199/miniboone+particle+identification}.
+\end{thebibliography}
+
+\end{document}
