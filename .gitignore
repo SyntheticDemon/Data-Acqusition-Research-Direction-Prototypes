@@ -4,3 +4,4 @@ __pycache__/
 *.fls
 *.log
 *.out
+artifacts/
