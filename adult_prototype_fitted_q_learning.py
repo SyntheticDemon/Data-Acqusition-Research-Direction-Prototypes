@@ -31,7 +31,7 @@ from sklearn.preprocessing import OrdinalEncoder, PolynomialFeatures, StandardSc
 from tqdm.auto import tqdm
 
 
-Q_ACTIONS = ["Acquire", "Retrain", "Evaluate", "Stop"]
+Q_ACTIONS = ["Acquire", "Train", "TrainEvaluate", "Stop"]
 
 SUPPORTED_METRICS = (
     "f1",
@@ -118,7 +118,7 @@ def compute_rolling_eval_score_change_features(
     return features
 
 
-Q_POLICY_BUNDLE_VERSION = 13
+Q_POLICY_BUNDLE_VERSION = 14
 DEFAULT_Q_POLICY_ARTIFACT_PATH = Path("artifacts/fitted_q_policy.joblib")
 
 
@@ -157,10 +157,13 @@ def lagrangian_action_penalty(action, lagrangian_lambdas, config):
         return 0.0
     if action == "Acquire":
         return lagrangian_lambdas["lambda_acquisition"]
-    if action == "Retrain":
+    if action == "Train":
         return lagrangian_lambdas["lambda_retrain"]
-    if action == "Evaluate":
-        return lagrangian_lambdas["lambda_evaluation"]
+    if action == "TrainEvaluate":
+        return (
+            lagrangian_lambdas["lambda_retrain"]
+            + lagrangian_lambdas["lambda_evaluation"]
+        )
     return 0.0
 
 
@@ -1269,13 +1272,73 @@ def make_state(
     )
 
 
+def retrain_with_pending_rows(
+    make_model,
+    training_features,
+    training_targets,
+    pending_row_indices,
+    pool_features,
+    pool_targets,
+):
+    training_features = np.vstack(
+        [training_features, pool_features[pending_row_indices]]
+    )
+    training_targets = pd.concat(
+        [training_targets, pool_targets.iloc[pending_row_indices]],
+        ignore_index=True,
+    )
+    model = make_model()
+    model.fit(training_features, training_targets)
+    return training_features, training_targets, model
+
+
+def apply_policy_evaluation_update(
+    model,
+    model_version,
+    experiment,
+    config,
+    evaluation_score_by_model_version,
+    evaluation_incremental_change_history,
+    previous_evaluation_score_for_incremental,
+    initial_evaluation_score,
+    evaluation_return_windows,
+):
+    if model_version not in evaluation_score_by_model_version:
+        evaluation_score_by_model_version[model_version] = policy_evaluation_score(
+            model, experiment, config
+        )
+    evaluation_score = evaluation_score_by_model_version[model_version]
+    incremental_change = evaluation_score - previous_evaluation_score_for_incremental
+    evaluation_incremental_change_history.append(incremental_change)
+    previous_evaluation_score_for_incremental = evaluation_score
+    last_eval_score_change = eval_score_change_from_start(
+        evaluation_score, initial_evaluation_score
+    )
+    rolling_eval_score_change_features = compute_rolling_eval_score_change_features(
+        evaluation_incremental_change_history,
+        evaluation_score,
+        initial_evaluation_score,
+        evaluation_return_windows,
+    )
+    return {
+        "evaluation_score": evaluation_score,
+        "latest_evaluation_score": evaluation_score,
+        "last_eval_score_change": last_eval_score_change,
+        "rolling_eval_score_change_features": rolling_eval_score_change_features,
+        "evaluation_incremental_change_history": evaluation_incremental_change_history,
+        "previous_evaluation_score_for_incremental": (
+            previous_evaluation_score_for_incremental
+        ),
+        "evaluation_score_by_model_version": evaluation_score_by_model_version,
+    }
+
+
 def feasible_actions(
     available_row_count,
     pending_row_count,
     remaining_acquisition_budget,
     remaining_retrain_budget,
     remaining_evaluation_budget,
-    model_needs_evaluation,
     config,
     pool_acquisition_order=None,
     acquisition_order_cursor=0,
@@ -1287,17 +1350,13 @@ def feasible_actions(
         pool_acquisition_order,
         acquisition_order_cursor,
     )
-    can_retrain = pending_row_count > 0 and remaining_retrain_budget > 0
+    can_train = pending_row_count > 0 and remaining_retrain_budget > 0
     if can_acquire:
         actions.append("Acquire")
-    if can_retrain:
-        actions.append("Retrain")
-    if (
-        can_acquire
-        and model_needs_evaluation
-        and remaining_evaluation_budget > 0
-    ):
-        actions.append("Evaluate")
+    if can_train:
+        actions.append("Train")
+    if can_train and remaining_evaluation_budget > 0:
+        actions.append("TrainEvaluate")
     if config.get("allow_stop_action", True):
         actions.append("Stop")
     return actions
@@ -1313,24 +1372,24 @@ def predicted_q_by_action(state, q_models, q_model_is_fitted):
 EPISODE_ACTION_FILL_COLORS = {
     "Initial": "rgba(158, 158, 158, 0.18)",
     "Acquire": "rgba(31, 119, 180, 0.18)",
-    "Retrain": "rgba(44, 160, 44, 0.18)",
-    "Evaluate": "rgba(255, 127, 14, 0.18)",
+    "Train": "rgba(44, 160, 44, 0.18)",
+    "TrainEvaluate": "rgba(255, 127, 14, 0.18)",
     "Stop": "rgba(214, 39, 40, 0.18)",
     "FinalRetrain": "rgba(148, 103, 189, 0.22)",
 }
 
 EPISODE_ACTION_LINE_COLORS = {
     "Acquire": "rgb(31, 119, 180)",
-    "Retrain": "rgb(44, 160, 44)",
-    "Evaluate": "rgb(255, 127, 14)",
+    "Train": "rgb(44, 160, 44)",
+    "TrainEvaluate": "rgb(255, 127, 14)",
     "Stop": "rgb(214, 39, 40)",
 }
 
 EPISODE_ACTION_BAND_LEGEND = [
     ("Initial", "rgb(158, 158, 158)"),
     ("Acquire", EPISODE_ACTION_LINE_COLORS["Acquire"]),
-    ("Retrain", EPISODE_ACTION_LINE_COLORS["Retrain"]),
-    ("Evaluate", EPISODE_ACTION_LINE_COLORS["Evaluate"]),
+    ("Train", EPISODE_ACTION_LINE_COLORS["Train"]),
+    ("TrainEvaluate", EPISODE_ACTION_LINE_COLORS["TrainEvaluate"]),
     ("Stop", EPISODE_ACTION_LINE_COLORS["Stop"]),
     ("FinalRetrain", "rgb(148, 103, 189)"),
 ]
@@ -1650,7 +1709,7 @@ def baseline_policy_curves(experiment, config):
         acquire_retrain_records.append(
             {
                 "step": len(acquire_retrain_records),
-                "action": "Retrain",
+                "action": "Train",
                 "introspection_score": introspection_score(
                     model, experiment, config
                 ),
@@ -1837,7 +1896,7 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
         acquire_retrain_curve = baseline_curves["acquire_retrain"]
         acquire_retrain_comparison_curve = acquire_retrain_curve[
             acquire_retrain_curve["action"].isin(
-                ["Initial", "Retrain", "FinalRetrain", "Stop"]
+                ["Initial", "Train", "TrainEvaluate", "FinalRetrain", "Stop"]
             )
         ].copy()
         eval_set_label = eval_set.replace("_", " ")
@@ -1963,7 +2022,7 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
     figure.update_yaxes(
         title_text=metric_label(introspection_metric), row=1, col=1
     )
-    q_scale_column_names = [f"q_{action.lower()}" for action in ("Acquire", "Retrain")]
+    q_scale_column_names = [f"q_{action.lower()}" for action in ("Acquire", "Train")]
     q_scale_values = diagnostic_frame[q_scale_column_names].to_numpy(dtype=float).ravel()
     finite_q_values = q_scale_values[np.isfinite(q_scale_values)]
     if len(finite_q_values) > 0:
@@ -1974,7 +2033,7 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
         q_padding = 0.08 * (q_high - q_low)
         figure.update_yaxes(
             range=[q_low - q_padding, q_high + q_padding],
-            title_text="Predicted Q (Acquire/Retrain scale)",
+            title_text="Predicted Q (Acquire/Train scale)",
             row=2,
             col=1,
         )
@@ -2349,9 +2408,6 @@ def run_continuous_q_episode(
             remaining_acquisition_budget=remaining_acquisition_budget,
             remaining_retrain_budget=remaining_retrain_budget,
             remaining_evaluation_budget=remaining_evaluation_budget,
-            model_needs_evaluation=(
-                model_version not in evaluation_score_by_model_version
-            ),
             config=config,
             pool_acquisition_order=pool_acquisition_order,
             acquisition_order_cursor=acquisition_order_cursor,
@@ -2428,48 +2484,50 @@ def run_continuous_q_episode(
             )
             remaining_acquisition_budget -= 1
 
-        elif selected_action == "Retrain":
-            training_features = np.vstack(
-                [training_features, pool_features[pending_row_indices]]
-            )
-            training_targets = pd.concat(
-                [training_targets, pool_targets.iloc[pending_row_indices]],
-                ignore_index=True,
+        elif selected_action in ("Train", "TrainEvaluate"):
+            training_features, training_targets, model = retrain_with_pending_rows(
+                make_model,
+                training_features,
+                training_targets,
+                pending_row_indices,
+                pool_features,
+                pool_targets,
             )
             pending_row_indices = np.array([], dtype=np.int64)
             remaining_retrain_budget -= 1
-            model = make_model()
-            model.fit(training_features, training_targets)
             model_version += 1
             pool_acquisition_order = None
             pool_acquisition_order_uncertainties = None
             acquisition_order_cursor = 0
             pool_acquisition_plan_model_version = None
-
-        elif selected_action == "Evaluate":
-            if model_version not in evaluation_score_by_model_version:
-                evaluation_score_by_model_version[model_version] = (
-                    policy_evaluation_score(model, experiment, config)
-                )
-            evaluation_score = evaluation_score_by_model_version[model_version]
-            incremental_change = (
-                evaluation_score - previous_evaluation_score_for_incremental
-            )
-            evaluation_incremental_change_history.append(incremental_change)
-            previous_evaluation_score_for_incremental = evaluation_score
-            last_eval_score_change = eval_score_change_from_start(
-                evaluation_score, initial_evaluation_score
-            )
-            rolling_eval_score_change_features = (
-                compute_rolling_eval_score_change_features(
+            if selected_action == "TrainEvaluate":
+                remaining_evaluation_budget -= 1
+                evaluation_update = apply_policy_evaluation_update(
+                    model,
+                    model_version,
+                    experiment,
+                    config,
+                    evaluation_score_by_model_version,
                     evaluation_incremental_change_history,
-                    evaluation_score,
+                    previous_evaluation_score_for_incremental,
                     initial_evaluation_score,
                     evaluation_return_windows,
                 )
-            )
-            latest_evaluation_score = evaluation_score
-            remaining_evaluation_budget -= 1
+                evaluation_score = evaluation_update["evaluation_score"]
+                latest_evaluation_score = evaluation_update["latest_evaluation_score"]
+                last_eval_score_change = evaluation_update["last_eval_score_change"]
+                rolling_eval_score_change_features = evaluation_update[
+                    "rolling_eval_score_change_features"
+                ]
+                evaluation_incremental_change_history = evaluation_update[
+                    "evaluation_incremental_change_history"
+                ]
+                previous_evaluation_score_for_incremental = evaluation_update[
+                    "previous_evaluation_score_for_incremental"
+                ]
+                evaluation_score_by_model_version = evaluation_update[
+                    "evaluation_score_by_model_version"
+                ]
 
         elif selected_action == "Stop":
             terminal_result = finalize_and_score_terminal(
@@ -2662,9 +2720,6 @@ def run_continuous_q_episode(
             remaining_acquisition_budget=remaining_acquisition_budget,
             remaining_retrain_budget=remaining_retrain_budget,
             remaining_evaluation_budget=remaining_evaluation_budget,
-            model_needs_evaluation=(
-                model_version not in evaluation_score_by_model_version
-            ),
             config=config,
             pool_acquisition_order=pool_acquisition_order,
             acquisition_order_cursor=acquisition_order_cursor,
@@ -3124,8 +3179,8 @@ def summarize_training_progress(episode_results, replay_buffer, q_model_is_fitte
                 "replay_transition_count": len(replay_buffer),
                 "fitted_action_model_count": sum(q_model_is_fitted.values()),
                 "samples_for_acquire": sample_counts["Acquire"],
-                "samples_for_retrain": sample_counts["Retrain"],
-                "samples_for_evaluate": sample_counts["Evaluate"],
+                "samples_for_train": sample_counts["Train"],
+                "samples_for_trainevaluate": sample_counts["TrainEvaluate"],
                 "samples_for_stop": sample_counts["Stop"],
                 f"mean_terminal_{target_metric}_all_episodes": episode_results[
                     terminal_column
@@ -3242,7 +3297,7 @@ def print_experiment_report(
     final_pending_retrain_rows = int(summary_row["final_pending_retrain_rows"])
     print(
         f"\nFinal classifier: trained on {training_rows_at_end} rows "
-        f"(initial + policy Retrain actions"
+        f"(initial + policy Train actions"
         + (
             f" + {final_pending_retrain_rows} rows in end-of-episode flush"
             if final_pending_retrain_rows > 0

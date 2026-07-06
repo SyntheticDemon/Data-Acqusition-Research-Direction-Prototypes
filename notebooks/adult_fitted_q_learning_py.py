@@ -344,7 +344,7 @@ plot_episode_step_diagnostics(
 # ## Custom-budget rollout
 #
 # The saved Q-policy is not refitted. The task classifier can still retrain when
-# the policy selects `Retrain`. Budget-size state features distinguish interpolation
+# the policy selects `Train`. Budget-size state features distinguish interpolation
 # inside the training ranges from extrapolation beyond them.
 
 # %%
