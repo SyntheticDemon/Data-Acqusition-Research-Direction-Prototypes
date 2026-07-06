@@ -332,8 +332,31 @@ def metric_value(targets, probabilities, metric_name, threshold=0.5):
 
 
 def model_metric_on_split(model, features, targets, metric_name, threshold=0.5):
-    probabilities = model.predict_proba(features)[:, 1]
-    return metric_value(targets, probabilities, metric_name, threshold)
+    validate_metric_name(metric_name)
+    targets = np.asarray(targets)
+    probabilities = model.predict_proba(features)
+    if probabilities.shape[1] == 2:
+        return metric_value(
+            targets, probabilities[:, 1], metric_name, threshold=threshold
+        )
+    predicted_labels = model.predict(features)
+    if metric_name == "accuracy":
+        return float(accuracy_score(targets, predicted_labels))
+    if metric_name == "balanced_accuracy":
+        return float(balanced_accuracy_score(targets, predicted_labels))
+    if metric_name == "f1":
+        return float(
+            f1_score(targets, predicted_labels, average="macro", zero_division=0.0)
+        )
+    if metric_name == "roc_auc":
+        return float(
+            roc_auc_score(
+                targets, probabilities, multi_class="ovr", average="macro"
+            )
+        )
+    raise ValueError(
+        f"Metric {metric_name!r} is not supported for multi-class splits"
+    )
 
 
 def split_features_targets(experiment, split_name):
@@ -999,47 +1022,20 @@ def make_q_model_is_fitted():
 def row_uncertainty_scores(model, pool_features, row_indices):
     if len(row_indices) == 0:
         return np.array([], dtype=np.float64)
-    probabilities = model.predict_proba(pool_features[row_indices])[:, 1]
+    probabilities = model.predict_proba(pool_features[row_indices])
     probabilities = np.clip(
         np.asarray(probabilities, dtype=np.float64), 1e-9, 1.0 - 1e-9
     )
-    one_minus_probabilities = 1.0 - probabilities
-    return (
-        -probabilities * np.log(probabilities)
-        - one_minus_probabilities * np.log(one_minus_probabilities)
-    )
+    if probabilities.shape[1] == 2:
+        one_minus_probabilities = 1.0 - probabilities[:, 1]
+        return (
+            -probabilities[:, 1] * np.log(probabilities[:, 1])
+            - one_minus_probabilities * np.log(one_minus_probabilities)
+        )
+    return -np.sum(probabilities * np.log(probabilities), axis=1)
 
 
-def ensure_pool_uncertainty_cache(
-    model,
-    pool_features,
-    pool_row_count,
-    cache_key,
-    pool_uncertainty_cache,
-    cached_key,
-):
-    if pool_uncertainty_cache is not None and cached_key == cache_key:
-        return pool_uncertainty_cache, cached_key
-    pool_uncertainty_cache = row_uncertainty_scores(
-        model,
-        pool_features,
-        np.arange(pool_row_count, dtype=np.int64),
-    )
-    return pool_uncertainty_cache, cache_key
-
-
-def select_top_k_pool_rows(
-    model,
-    pool_features,
-    available_row_indices,
-    batch_size,
-    config,
-    pool_uncertainty_cache=None,
-):
-    """Pick highest-uncertainty rows inside a pool percentile band."""
-    if len(available_row_indices) == 0:
-        raise ValueError("No pool rows available to acquire.")
-
+def acquisition_percentile_band(uncertainties, config):
     percentile_low = float(config.get("acquisition_percentile_low", 0.0))
     percentile_high = float(config.get("acquisition_percentile_high", 100.0))
     if not (0.0 <= percentile_low < percentile_high <= 100.0):
@@ -1048,35 +1044,158 @@ def select_top_k_pool_rows(
             "0 <= low < high <= 100; "
             f"got low={percentile_low}, high={percentile_high}"
         )
-
-    if pool_uncertainty_cache is not None:
-        if len(pool_uncertainty_cache) != pool_features.shape[0]:
-            raise ValueError(
-                "pool_uncertainty_cache length must match acquisition pool rows"
-            )
-        uncertainties = pool_uncertainty_cache[available_row_indices]
-    else:
-        uncertainties = row_uncertainty_scores(
-            model, pool_features, available_row_indices
-        )
-    row_count_to_acquire = min(batch_size, len(available_row_indices))
-
     low_cut = np.percentile(uncertainties, percentile_low)
     high_cut = np.percentile(uncertainties, percentile_high)
     in_band = (uncertainties >= low_cut) & (uncertainties <= high_cut)
     eligible_positions = np.where(in_band)[0]
     if len(eligible_positions) == 0:
-        eligible_positions = np.arange(len(available_row_indices))
+        eligible_positions = np.arange(len(uncertainties))
+    return eligible_positions
 
+
+def build_pool_acquisition_order(
+    model, pool_features, available_row_indices, config
+):
+    """Rank remaining pool rows once for the current model version."""
+    if len(available_row_indices) == 0:
+        raise ValueError("No pool rows available to rank for acquisition.")
+    uncertainties = row_uncertainty_scores(
+        model, pool_features, available_row_indices
+    )
+    eligible_positions = acquisition_percentile_band(uncertainties, config)
     eligible_uncertainties = uncertainties[eligible_positions]
-    pick_count = min(row_count_to_acquire, len(eligible_positions))
-    top_within_eligible = np.argsort(eligible_uncertainties)[-pick_count:]
-    top_positions = eligible_positions[top_within_eligible]
+    top_to_bottom = np.argsort(eligible_uncertainties)[::-1]
+    ordered_positions = eligible_positions[top_to_bottom]
+    return (
+        available_row_indices[ordered_positions],
+        eligible_uncertainties[top_to_bottom],
+    )
 
-    selected_row_indices = available_row_indices[top_positions]
-    mean_row_utility = float(np.mean(uncertainties[top_positions]))
-    remaining_row_indices = np.delete(available_row_indices, top_positions)
-    return selected_row_indices, mean_row_utility, remaining_row_indices
+
+def take_next_acquisition_batch(
+    pool_acquisition_order,
+    pool_acquisition_order_uncertainties,
+    acquisition_order_cursor,
+    batch_size,
+):
+    if acquisition_order_cursor >= len(pool_acquisition_order):
+        raise ValueError("Acquisition order is exhausted.")
+    batch_end = min(
+        acquisition_order_cursor + batch_size, len(pool_acquisition_order)
+    )
+    selected_row_indices = pool_acquisition_order[
+        acquisition_order_cursor:batch_end
+    ]
+    mean_row_utility = float(
+        np.mean(
+            pool_acquisition_order_uncertainties[
+                acquisition_order_cursor:batch_end
+            ]
+        )
+    )
+    return (
+        selected_row_indices,
+        mean_row_utility,
+        batch_end,
+    )
+
+
+def ensure_pool_acquisition_plan(
+    model,
+    pool_features,
+    available_row_indices,
+    config,
+    pool_acquisition_order,
+    pool_acquisition_order_uncertainties,
+    acquisition_order_cursor,
+    plan_model_version,
+    model_version,
+):
+    if (
+        pool_acquisition_order is None
+        or plan_model_version != model_version
+    ):
+        (
+            pool_acquisition_order,
+            pool_acquisition_order_uncertainties,
+        ) = build_pool_acquisition_order(
+            model, pool_features, available_row_indices, config
+        )
+        acquisition_order_cursor = 0
+        plan_model_version = model_version
+    return (
+        pool_acquisition_order,
+        pool_acquisition_order_uncertainties,
+        acquisition_order_cursor,
+        plan_model_version,
+    )
+
+
+def acquire_next_pool_batch(
+    model,
+    pool_features,
+    available_row_indices,
+    batch_size,
+    config,
+    pool_acquisition_order,
+    pool_acquisition_order_uncertainties,
+    acquisition_order_cursor,
+    plan_model_version,
+    model_version,
+):
+    if len(available_row_indices) == 0:
+        raise ValueError("No pool rows available to acquire.")
+    (
+        pool_acquisition_order,
+        pool_acquisition_order_uncertainties,
+        acquisition_order_cursor,
+        plan_model_version,
+    ) = ensure_pool_acquisition_plan(
+        model,
+        pool_features,
+        available_row_indices,
+        config,
+        pool_acquisition_order,
+        pool_acquisition_order_uncertainties,
+        acquisition_order_cursor,
+        plan_model_version,
+        model_version,
+    )
+    (
+        selected_row_indices,
+        mean_row_utility,
+        acquisition_order_cursor,
+    ) = take_next_acquisition_batch(
+        pool_acquisition_order,
+        pool_acquisition_order_uncertainties,
+        acquisition_order_cursor,
+        batch_size,
+    )
+    remaining_row_indices = np.setdiff1d(
+        available_row_indices, selected_row_indices, assume_unique=True
+    )
+    return (
+        selected_row_indices,
+        mean_row_utility,
+        remaining_row_indices,
+        pool_acquisition_order,
+        pool_acquisition_order_uncertainties,
+        acquisition_order_cursor,
+        plan_model_version,
+    )
+
+
+def can_acquire_from_pool_plan(
+    available_row_count,
+    remaining_acquisition_budget,
+    pool_acquisition_order,
+    acquisition_order_cursor,
+):
+    if remaining_acquisition_budget <= 0 or available_row_count <= 0:
+        return False
+    if pool_acquisition_order is None:
+        return True
+    return acquisition_order_cursor < len(pool_acquisition_order)
 
 
 def assert_acquired_rows_not_in_pool(available_row_indices, pending_row_indices):
@@ -1154,11 +1273,15 @@ def feasible_actions(
     remaining_evaluation_budget,
     model_needs_evaluation,
     config,
+    pool_acquisition_order=None,
+    acquisition_order_cursor=0,
 ):
     actions = []
-    can_acquire = (
-        available_row_count > 0
-        and remaining_acquisition_budget > 0
+    can_acquire = can_acquire_from_pool_plan(
+        available_row_count,
+        remaining_acquisition_budget,
+        pool_acquisition_order,
+        acquisition_order_cursor,
     )
     can_retrain = pending_row_count > 0 and remaining_retrain_budget > 0
     if can_acquire:
@@ -1254,6 +1377,7 @@ def append_final_retrain_diagnostic(
     q_model_is_fitted,
     model_version,
     training_rows,
+    acquisitions_so_far,
     remaining_acquisition_budget,
     remaining_retrain_budget,
     remaining_evaluation_budget,
@@ -1280,6 +1404,7 @@ def append_final_retrain_diagnostic(
             "model_version": model_version,
             "pending_rows": 0,
             "training_rows": training_rows,
+            "acquisitions_so_far": acquisitions_so_far,
             "acquired_row_indices": [],
         }
     )
@@ -1315,25 +1440,37 @@ def baseline_policy_curves(experiment, config):
     ]
     acquire_only_cost = 0
     acquire_only_selected_rows = []
-    acquire_only_uncertainty_cache, _ = ensure_pool_uncertainty_cache(
-        acquire_only_model,
-        pool_features,
-        config["acquisition_pool_rows"],
-        0,
-        None,
-        None,
-    )
-    while (
-        acquire_only_cost < config["acquisition_budget"]
-        and len(acquire_only_available_rows) > 0
-    ):
-        selected_row_indices, _, acquire_only_available_rows = select_top_k_pool_rows(
+    acquire_only_order, acquire_only_order_uncertainties = (
+        build_pool_acquisition_order(
             acquire_only_model,
             pool_features,
             acquire_only_available_rows,
-            batch_size,
             config,
-            pool_uncertainty_cache=acquire_only_uncertainty_cache,
+        )
+    )
+    acquire_only_order_cursor = 0
+    acquire_only_progress = tqdm(
+        range(config["acquisition_budget"]),
+        desc="Baseline acquire-only: acquire",
+        unit="batch",
+    )
+    for _ in acquire_only_progress:
+        if acquire_only_order_cursor >= len(acquire_only_order):
+            break
+        (
+            selected_row_indices,
+            _mean_row_utility,
+            acquire_only_order_cursor,
+        ) = take_next_acquisition_batch(
+            acquire_only_order,
+            acquire_only_order_uncertainties,
+            acquire_only_order_cursor,
+            batch_size,
+        )
+        acquire_only_available_rows = np.setdiff1d(
+            acquire_only_available_rows,
+            selected_row_indices,
+            assume_unique=True,
         )
         acquire_only_selected_rows.extend(selected_row_indices.tolist())
         acquire_only_cost += 1
@@ -1348,8 +1485,17 @@ def baseline_policy_curves(experiment, config):
                 "retrain_cost": 0,
             }
         )
+        acquire_only_progress.set_postfix(
+            acquired=acquire_only_cost,
+            score=f"{acquire_only_records[-1]['introspection_score']:.4f}",
+        )
     acquire_only_retrain_cost = 0
     if acquire_only_selected_rows and config["retrain_budget"] > 0:
+        acquire_only_retrain_progress = tqdm(
+            total=1,
+            desc="Baseline acquire-only: final retrain",
+            unit="step",
+        )
         acquired_row_indices = np.asarray(
             acquire_only_selected_rows, dtype=np.int64
         )
@@ -1383,6 +1529,10 @@ def baseline_policy_curves(experiment, config):
                 "retrain_cost": acquire_only_retrain_cost,
             }
         )
+        acquire_only_retrain_progress.update(1)
+        acquire_only_retrain_progress.set_postfix(
+            score=f"{acquire_only_records[-1]['introspection_score']:.4f}",
+        )
     acquire_only_records.append(
         {
             "step": len(acquire_only_records),
@@ -1408,8 +1558,10 @@ def baseline_policy_curves(experiment, config):
     model.fit(training_features, training_targets)
     model_is_current = True
     acquire_retrain_model_key = 0
-    pool_uncertainty_cache = None
-    cached_uncertainty_key = None
+    pool_acquisition_order = None
+    pool_acquisition_order_uncertainties = None
+    acquisition_order_cursor = 0
+    plan_model_version = None
     acquire_retrain_records = [
         {
             "step": 0,
@@ -1419,30 +1571,46 @@ def baseline_policy_curves(experiment, config):
             "retrain_cost": 0,
         }
     ]
-    while (
-        remaining_acquisition_budget > 0
-        and remaining_retrain_budget > 0
-        and len(available_row_indices) > 0
-    ):
-        pool_uncertainty_cache, cached_uncertainty_key = ensure_pool_uncertainty_cache(
-            model,
-            pool_features,
-            config["acquisition_pool_rows"],
-            acquire_retrain_model_key,
-            pool_uncertainty_cache,
-            cached_uncertainty_key,
-        )
+    acquire_retrain_pair_budget = min(
+        config["acquisition_budget"],
+        config["retrain_budget"],
+    )
+    acquire_retrain_pair_progress = tqdm(
+        range(acquire_retrain_pair_budget),
+        desc="Baseline acquire→retrain: acquire + retrain",
+        unit="pair",
+    )
+    for _ in acquire_retrain_pair_progress:
+        if not (
+            remaining_acquisition_budget > 0
+            and remaining_retrain_budget > 0
+            and can_acquire_from_pool_plan(
+                len(available_row_indices),
+                remaining_acquisition_budget,
+                pool_acquisition_order,
+                acquisition_order_cursor,
+            )
+        ):
+            break
         (
             selected_row_indices,
             _mean_row_utility,
             available_row_indices,
-        ) = select_top_k_pool_rows(
+            pool_acquisition_order,
+            pool_acquisition_order_uncertainties,
+            acquisition_order_cursor,
+            plan_model_version,
+        ) = acquire_next_pool_batch(
             model,
             pool_features,
             available_row_indices,
             batch_size,
             config,
-            pool_uncertainty_cache=pool_uncertainty_cache,
+            pool_acquisition_order,
+            pool_acquisition_order_uncertainties,
+            acquisition_order_cursor,
+            plan_model_version,
+            acquire_retrain_model_key,
         )
         remaining_acquisition_budget -= 1
         acquire_retrain_records.append(
@@ -1471,6 +1639,10 @@ def baseline_policy_curves(experiment, config):
         remaining_retrain_budget -= 1
         model_is_current = True
         acquire_retrain_model_key += 1
+        pool_acquisition_order = None
+        pool_acquisition_order_uncertainties = None
+        acquisition_order_cursor = 0
+        plan_model_version = None
         acquire_retrain_records.append(
             {
                 "step": len(acquire_retrain_records),
@@ -1484,54 +1656,81 @@ def baseline_policy_curves(experiment, config):
                 - remaining_retrain_budget,
             }
         )
-    while remaining_acquisition_budget > 0 and len(available_row_indices) > 0:
-        pool_uncertainty_cache, cached_uncertainty_key = ensure_pool_uncertainty_cache(
-            model,
-            pool_features,
-            config["acquisition_pool_rows"],
-            acquire_retrain_model_key,
-            pool_uncertainty_cache,
-            cached_uncertainty_key,
+        acquire_retrain_pair_progress.set_postfix(
+            acquired=config["acquisition_budget"] - remaining_acquisition_budget,
+            retrained=config["retrain_budget"] - remaining_retrain_budget,
+            score=f"{acquire_retrain_records[-1]['introspection_score']:.4f}",
         )
-        (
-            selected_row_indices,
-            _mean_row_utility,
-            available_row_indices,
-        ) = select_top_k_pool_rows(
-            model,
-            pool_features,
-            available_row_indices,
-            batch_size,
-            config,
-            pool_uncertainty_cache=pool_uncertainty_cache,
+    if remaining_acquisition_budget > 0:
+        acquire_retrain_extra_progress = tqdm(
+            range(remaining_acquisition_budget),
+            desc="Baseline acquire→retrain: acquire (retrain budget exhausted)",
+            unit="batch",
         )
-        remaining_acquisition_budget -= 1
-        training_features = np.vstack(
-            [training_features, pool_features[selected_row_indices]]
-        )
-        training_targets = pd.concat(
-            [training_targets, pool_targets.iloc[selected_row_indices]],
-            ignore_index=True,
-        )
-        model_is_current = False
-        acquire_retrain_records.append(
-            {
-                "step": len(acquire_retrain_records),
-                "action": "Acquire",
-                "introspection_score": introspection_score(
-                    model, experiment, config
-                ),
-                "acquisition_cost": config["acquisition_budget"]
-                - remaining_acquisition_budget,
-                "retrain_cost": config["retrain_budget"]
-                - remaining_retrain_budget,
-            }
-        )
+        for _ in acquire_retrain_extra_progress:
+            if not can_acquire_from_pool_plan(
+                len(available_row_indices),
+                remaining_acquisition_budget,
+                pool_acquisition_order,
+                acquisition_order_cursor,
+            ):
+                break
+            (
+                selected_row_indices,
+                _mean_row_utility,
+                available_row_indices,
+                pool_acquisition_order,
+                pool_acquisition_order_uncertainties,
+                acquisition_order_cursor,
+                plan_model_version,
+            ) = acquire_next_pool_batch(
+                model,
+                pool_features,
+                available_row_indices,
+                batch_size,
+                config,
+                pool_acquisition_order,
+                pool_acquisition_order_uncertainties,
+                acquisition_order_cursor,
+                plan_model_version,
+                acquire_retrain_model_key,
+            )
+            remaining_acquisition_budget -= 1
+            training_features = np.vstack(
+                [training_features, pool_features[selected_row_indices]]
+            )
+            training_targets = pd.concat(
+                [training_targets, pool_targets.iloc[selected_row_indices]],
+                ignore_index=True,
+            )
+            model_is_current = False
+            acquire_retrain_records.append(
+                {
+                    "step": len(acquire_retrain_records),
+                    "action": "Acquire",
+                    "introspection_score": introspection_score(
+                        model, experiment, config
+                    ),
+                    "acquisition_cost": config["acquisition_budget"]
+                    - remaining_acquisition_budget,
+                    "retrain_cost": config["retrain_budget"]
+                    - remaining_retrain_budget,
+                }
+            )
+            acquire_retrain_extra_progress.set_postfix(
+                acquired=config["acquisition_budget"] - remaining_acquisition_budget,
+                score=f"{acquire_retrain_records[-1]['introspection_score']:.4f}",
+            )
     acquisition_cost_so_far = (
         config["acquisition_budget"] - remaining_acquisition_budget
     )
     retrain_cost_so_far = config["retrain_budget"] - remaining_retrain_budget
     if not model_is_current and config["retrain_budget"] > 0:
+        acquire_retrain_final_retrain_progress = tqdm(
+            total=1,
+            desc="Baseline acquire→retrain: final retrain",
+            unit="step",
+        )
         model = make_model()
         model.fit(training_features, training_targets)
         model_is_current = True
@@ -1546,6 +1745,10 @@ def baseline_policy_curves(experiment, config):
                 "acquisition_cost": acquisition_cost_so_far,
                 "retrain_cost": retrain_cost_so_far,
             }
+        )
+        acquire_retrain_final_retrain_progress.update(1)
+        acquire_retrain_final_retrain_progress.set_postfix(
+            score=f"{acquire_retrain_records[-1]['introspection_score']:.4f}",
         )
     acquire_retrain_records.append(
         {
@@ -1579,7 +1782,7 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
     eval_set = config.get("introspection_eval_set", "hidden_validation")
     introspection_metric = metric_from_config(config, "introspection")
     introspection_label = (
-        f"{eval_set.replace('_', ' ')} {metric_label(introspection_metric)} (after step)"
+        f"{eval_set.replace('_', ' ')} {metric_label(introspection_metric)} (after action)"
     )
     target_metric = metric_from_config(config, "target")
     policy_metric = metric_from_config(config, "policy")
@@ -1587,34 +1790,35 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
     figure = make_subplots(
         rows=2,
         cols=1,
-        shared_xaxes=True,
+        shared_xaxes=False,
         vertical_spacing=0.1,
         subplot_titles=(
             (
-                f"Top: model quality after each step — "
+                f"Top: model quality vs acquisitions completed — "
                 f"{metric_label(introspection_metric)} on {eval_set.replace('_', ' ')} "
-                "(agent and two fixed baseline policies)"
+                "(agent and fixed baselines on a shared acquisition-count axis)"
             ),
             "Bottom: predicted Q at decision time, before the banded action runs",
         ),
     )
     figure.add_trace(
         go.Scatter(
-            x=diagnostic_frame["step"],
+            x=diagnostic_frame["acquisitions_so_far"],
             y=diagnostic_frame["introspection_score"],
             mode="lines+markers",
             name=f"fitted Q policy: {introspection_label}",
             line={"width": 3, "color": "rgb(214, 39, 40)"},
             marker={"size": 8, "color": "rgb(214, 39, 40)"},
             customdata=diagnostic_frame[
-                ["model_version", "pending_rows", "action"]
+                ["step", "model_version", "pending_rows", "action"]
             ].to_numpy(),
             hovertemplate=(
-                "Step %{x}<br>"
+                "Acquisitions completed=%{x}<br>"
+                "episode step=%{customdata[0]}<br>"
                 f"{introspection_label}=%{{y:.4f}}<br>"
-                "model_version=%{customdata[0]}<br>"
-                "pending_rows=%{customdata[1]}<br>"
-                "action=%{customdata[2]}<extra></extra>"
+                "model_version=%{customdata[1]}<br>"
+                "pending_rows=%{customdata[2]}<br>"
+                "action=%{customdata[3]}<extra></extra>"
             ),
         ),
         row=1,
@@ -1623,13 +1827,19 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
     if experiment is not None:
         benchmark_config = {**experiment["config"], **config}
         benchmark_config = resolve_row_count_config(benchmark_config)
+        tqdm.write("Running baseline policies for diagnostics plot...")
         baseline_curves = baseline_policy_curves(experiment, benchmark_config)
         acquire_only_curve = baseline_curves["acquire_only"]
         acquire_retrain_curve = baseline_curves["acquire_retrain"]
+        acquire_retrain_comparison_curve = acquire_retrain_curve[
+            acquire_retrain_curve["action"].isin(
+                ["Initial", "Retrain", "FinalRetrain", "Stop"]
+            )
+        ].copy()
         eval_set_label = eval_set.replace("_", " ")
         figure.add_trace(
             go.Scatter(
-                x=acquire_only_curve["step"],
+                x=acquire_only_curve["acquisition_cost"],
                 y=acquire_only_curve["introspection_score"],
                 mode="lines+markers",
                 name=(
@@ -1639,14 +1849,15 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
                 line={"width": 2, "dash": "dot", "color": "rgb(120, 120, 120)"},
                 marker={"size": 7, "symbol": "circle-open"},
                 customdata=acquire_only_curve[
-                    ["action", "acquisition_cost", "retrain_cost"]
+                    ["step", "action", "acquisition_cost", "retrain_cost"]
                 ].to_numpy(),
                 hovertemplate=(
-                    "Step %{x}<br>"
+                    "Acquisitions completed=%{x}<br>"
+                    "baseline step=%{customdata[0]}<br>"
                     f"batch acquisition {metric_label(introspection_metric)}=%{{y:.4f}}<br>"
-                    "action=%{customdata[0]}<br>"
-                    "acquisition cost=%{customdata[1]}<br>"
-                    "retrain cost=%{customdata[2]}<extra></extra>"
+                    "action=%{customdata[1]}<br>"
+                    "acquisition cost=%{customdata[2]}<br>"
+                    "retrain cost=%{customdata[3]}<extra></extra>"
                 ),
             ),
             row=1,
@@ -1654,24 +1865,25 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
         )
         figure.add_trace(
             go.Scatter(
-                x=acquire_retrain_curve["step"],
-                y=acquire_retrain_curve["introspection_score"],
+                x=acquire_retrain_comparison_curve["acquisition_cost"],
+                y=acquire_retrain_comparison_curve["introspection_score"],
                 mode="lines+markers",
                 name=(
-                    f"acquire → retrain baseline: {eval_set_label} "
+                    f"acquire → retrain baseline (after retrain): {eval_set_label} "
                     f"{metric_label(introspection_metric)}"
                 ),
                 line={"width": 2, "dash": "dash", "color": "rgb(31, 119, 180)"},
                 marker={"size": 7, "symbol": "triangle-up"},
-                customdata=acquire_retrain_curve[
-                    ["action", "acquisition_cost", "retrain_cost"]
+                customdata=acquire_retrain_comparison_curve[
+                    ["step", "action", "acquisition_cost", "retrain_cost"]
                 ].to_numpy(),
                 hovertemplate=(
-                    "Step %{x}<br>"
+                    "Acquisitions completed=%{x}<br>"
+                    "baseline step=%{customdata[0]}<br>"
                     f"acquire → retrain {metric_label(introspection_metric)}=%{{y:.4f}}<br>"
-                    "action=%{customdata[0]}<br>"
-                    "acquisition cost=%{customdata[1]}<br>"
-                    "retrain cost=%{customdata[2]}<extra></extra>"
+                    "action=%{customdata[1]}<br>"
+                    "acquisition cost=%{customdata[2]}<br>"
+                    "retrain cost=%{customdata[3]}<extra></extra>"
                 ),
             ),
             row=1,
@@ -1722,29 +1934,28 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
         fill_color = EPISODE_ACTION_FILL_COLORS.get(
             row["action"], "rgba(200, 200, 200, 0.15)"
         )
-        for subplot_row in (1, 2):
-            figure.add_vrect(
-                x0=row["step"] - 0.5,
-                x1=row["step"] + 0.5,
-                fillcolor=fill_color,
-                layer="below",
-                line_width=0,
-                row=subplot_row,
-                col=1,
-            )
+        figure.add_vrect(
+            x0=row["step"] - 0.5,
+            x1=row["step"] + 0.5,
+            fillcolor=fill_color,
+            layer="below",
+            line_width=0,
+            row=2,
+            col=1,
+        )
 
     figure.update_layout(
         title=(
             "Final episode diagnostics "
             f"(target={metric_label(target_metric)}, policy={metric_label(policy_metric)}). "
-            "Vertical bands = action at that step (see legend). "
-            f"Top = policy-model {metric_label(introspection_metric)} after the action "
-            "plus budget-respecting baselines; bottom = Q before the action."
+            "Top x-axis = acquisitions completed (baselines aligned after each retrain); "
+            "bottom x-axis = episode step with action bands."
         ),
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.08, "x": 0},
         height=720,
     )
-    figure.update_xaxes(title_text="Step", row=2, col=1)
+    figure.update_xaxes(title_text="Acquisitions completed", row=1, col=1)
+    figure.update_xaxes(title_text="Episode step", row=2, col=1)
     figure.update_yaxes(
         title_text=metric_label(introspection_metric), row=1, col=1
     )
@@ -2086,8 +2297,10 @@ def run_continuous_q_episode(
 
     pool_features = experiment["acquisition_pool_features"]
     pool_targets = experiment["acquisition_pool_targets"]
-    pool_uncertainty_cache = None
-    pool_uncertainty_cache_model_version = None
+    pool_acquisition_order = None
+    pool_acquisition_order_uncertainties = None
+    acquisition_order_cursor = 0
+    pool_acquisition_plan_model_version = None
 
     initial_state = make_state(
         pending_row_count=0,
@@ -2136,6 +2349,8 @@ def run_continuous_q_episode(
                 model_version not in evaluation_score_by_model_version
             ),
             config=config,
+            pool_acquisition_order=pool_acquisition_order,
+            acquisition_order_cursor=acquisition_order_cursor,
         )
         if not feasible_action_list:
             terminal_result = finalize_and_score_terminal(
@@ -2180,27 +2395,25 @@ def run_continuous_q_episode(
         )
 
         if selected_action == "Acquire":
-            pool_uncertainty_cache, pool_uncertainty_cache_model_version = (
-                ensure_pool_uncertainty_cache(
-                    model,
-                    pool_features,
-                    config["acquisition_pool_rows"],
-                    model_version,
-                    pool_uncertainty_cache,
-                    pool_uncertainty_cache_model_version,
-                )
-            )
             (
                 selected_row_indices,
                 mean_row_utility,
                 available_row_indices,
-            ) = select_top_k_pool_rows(
+                pool_acquisition_order,
+                pool_acquisition_order_uncertainties,
+                acquisition_order_cursor,
+                pool_acquisition_plan_model_version,
+            ) = acquire_next_pool_batch(
                 model,
                 pool_features,
                 available_row_indices,
                 batch_size,
                 config,
-                pool_uncertainty_cache=pool_uncertainty_cache,
+                pool_acquisition_order,
+                pool_acquisition_order_uncertainties,
+                acquisition_order_cursor,
+                pool_acquisition_plan_model_version,
+                model_version,
             )
             acquired_row_count = len(selected_row_indices)
             pending_row_indices = np.concatenate(
@@ -2224,8 +2437,10 @@ def run_continuous_q_episode(
             model = make_model()
             model.fit(training_features, training_targets)
             model_version += 1
-            pool_uncertainty_cache = None
-            pool_uncertainty_cache_model_version = None
+            pool_acquisition_order = None
+            pool_acquisition_order_uncertainties = None
+            acquisition_order_cursor = 0
+            pool_acquisition_plan_model_version = None
 
         elif selected_action == "Evaluate":
             if model_version not in evaluation_score_by_model_version:
@@ -2334,6 +2549,7 @@ def run_continuous_q_episode(
                         q_model_is_fitted,
                         model_version,
                         len(training_features),
+                        config["acquisition_budget"] - remaining_acquisition_budget,
                         remaining_acquisition_budget,
                         remaining_retrain_budget,
                         remaining_evaluation_budget,
@@ -2446,6 +2662,8 @@ def run_continuous_q_episode(
                 model_version not in evaluation_score_by_model_version
             ),
             config=config,
+            pool_acquisition_order=pool_acquisition_order,
+            acquisition_order_cursor=acquisition_order_cursor,
         )
 
         if not next_feasible_action_list:

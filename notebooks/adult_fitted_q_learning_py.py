@@ -68,14 +68,14 @@ config = {
     "held_out_batch_fractions": [0.01],
     "default_rollout_batch_fraction": 0.01,
     "training_batch_seed_offset": 40_000,
-    "episodes_per_batch_block": 100,
+    "episodes_per_batch_block": 150,
     "acquisition_percentile_low": 0,
     "acquisition_percentile_high": 95,
-    "number_of_training_episodes": 5000,
+    "number_of_training_episodes": 15000,
     "training_budget_ranges": {
-        "acquisition_budget": [1, 10],
-        "retrain_budget": [1, 10],
-        "evaluation_budget": [1, 10],
+        "acquisition_budget": [1, 30],
+        "retrain_budget": [1, 30],
+        "evaluation_budget": [1, 30],
     },
     "default_rollout_budgets": {
         "acquisition_budget": 8,
@@ -88,9 +88,9 @@ config = {
     "held_out_budget_combinations": [[8, 4, 6]],
     "training_budget_seed_offset": 30_000,
     # Train consecutive episodes at one budget before moving to the next.
-    "episodes_per_budget_block": 100,
+    "episodes_per_budget_block": 150,
     # Legacy single window still works: "evaluation_return_window": 5,
-    "evaluation_return_windows": [5, 10, 15, 30],
+    "evaluation_return_windows": [5, 10, 15],
     "discount_factor": 0.95,
     "initial_epsilon": 1.0,
     "final_epsilon": 0.1,
@@ -145,7 +145,7 @@ config = {
     "downstream_model": {
         "type": "hist_gradient_boosting",
         "learning_rate": 0.1,
-        "max_iter": 50,
+        "max_iter": 100,
         "max_leaf_nodes": 15,
         "min_samples_leaf": 5,
         "max_depth": 6,
@@ -348,9 +348,9 @@ plot_episode_step_diagnostics(
 # inside the training ranges from extrapolation beyond them.
 
 # %%
-CUSTOM_ACQUISITION_BUDGET = 30
-CUSTOM_RETRAIN_BUDGET = 2
-CUSTOM_EVALUATION_BUDGET = 30
+CUSTOM_ACQUISITION_BUDGET = 15
+CUSTOM_RETRAIN_BUDGET = 5
+CUSTOM_EVALUATION_BUDGET = 5
 
 custom_result = run_greedy_episode_with_budgets(
     q_models=q_models,
