@@ -405,6 +405,7 @@ def resolve_row_count_config(config):
         "test",
     ]
     fraction_keys = [f"{split_name}_fraction" for split_name in split_names]
+    row_count_keys = [f"{split_name}_rows" for split_name in split_names]
     supplied_fraction_keys = [key for key in fraction_keys if key in config]
 
     if supplied_fraction_keys:
@@ -423,13 +424,16 @@ def resolve_row_count_config(config):
                 f"got {fractions.sum():.8f}"
             )
 
-        exact_counts = fractions * int(config["total_rows"])
-        row_counts = np.floor(exact_counts).astype(int)
-        rows_left = int(config["total_rows"]) - int(row_counts.sum())
-        largest_remainders = np.argsort(-(exact_counts - row_counts))
-        row_counts[largest_remainders[:rows_left]] += 1
-        for split_name, row_count in zip(split_names, row_counts):
-            config[f"{split_name}_rows"] = int(row_count)
+        # Keep post-split row counts when an experiment was already materialized
+        # (e.g. MNIST labels_per_class overrides initial_train_rows).
+        if not all(key in config for key in row_count_keys):
+            exact_counts = fractions * int(config["total_rows"])
+            row_counts = np.floor(exact_counts).astype(int)
+            rows_left = int(config["total_rows"]) - int(row_counts.sum())
+            largest_remainders = np.argsort(-(exact_counts - row_counts))
+            row_counts[largest_remainders[:rows_left]] += 1
+            for split_name, row_count in zip(split_names, row_counts):
+                config[f"{split_name}_rows"] = int(row_count)
 
     if "batch_fraction" in config:
         batch_fraction = float(config["batch_fraction"])

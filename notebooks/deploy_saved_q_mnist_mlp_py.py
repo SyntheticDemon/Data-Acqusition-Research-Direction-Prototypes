@@ -61,9 +61,9 @@ RANDOM_SEED = 42
 ARTIFACT_PATH = PROJECT_ROOT / DEFAULT_Q_POLICY_ARTIFACT_PATH
 
 MNIST_DATA = {
-    "total_rows": 10_000,
+    "total_rows": 1_000,
     "use_full_mnist_test": True,
-    "labels_per_class": 500,
+    "labels_per_class": 10,
     "initial_train_fraction": 0.08,
     "acquisition_pool_fraction": 0.78,
     "evaluation_fraction": 0.05,
@@ -72,9 +72,9 @@ MNIST_DATA = {
 }
 
 ROLLOUT_BUDGETS = {
-    "acquisition_budget": 5,
-    "retrain_budget": 5,
-    "evaluation_budget": 5,
+    "acquisition_budget": 30,
+    "retrain_budget": 30,
+    "evaluation_budget": 30,
 }
 
 ROLLOUT_BATCH_FRACTION = 0.005
@@ -88,7 +88,7 @@ ACQUISITION_PERCENTILES = {
 
 MLP_DOWNSTREAM_MODEL = {
     "hidden_layer_sizes": [256, 128],
-    "max_iter": 200,
+    "max_iter": 30,
     "alpha": 1e-4,
     "early_stopping": True,
     "validation_fraction": 0.1,
