@@ -77,14 +77,20 @@ config = {
         "retrain_budget": [1, 30],
         "evaluation_budget": [1, 30],
     },
-    # Step through each range (default step is 1 = every integer).
+    # Each range accepts [minimum, maximum] or [minimum, maximum, step].
+    # "training_budget_ranges": {
+    #     "acquisition_budget": [1, 30, 2],
+    #     "retrain_budget": [1, 30, 4],
+    #     "evaluation_budget": [1, 30, 5],
+    # },
+    # Or set step globally / per dimension when using [minimum, maximum]:
     # "training_budget_step": 2,
     # "training_budget_steps": {
     #     "acquisition_budget": 2,
     #     "retrain_budget": 1,
     #     "evaluation_budget": 5,
     # },
-    # Or pass explicit value lists instead of range + step:
+    # Or pass explicit value lists (training_budget_ranges not required):
     # "training_budget_values": {
     #     "acquisition_budget": [1, 5, 10, 20, 30],
     #     "retrain_budget": [1, 4, 8, 12],

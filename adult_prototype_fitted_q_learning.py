@@ -546,6 +546,35 @@ def integer_range_values(minimum, maximum, step):
     return values
 
 
+def resolve_training_budget_dimension(name, range_spec, default_step, per_dimension_steps):
+    if not isinstance(range_spec, (list, tuple)):
+        raise ValueError(
+            f"training_budget_ranges[{name!r}] must be [minimum, maximum] "
+            "or [minimum, maximum, step]"
+        )
+    if len(range_spec) == 2:
+        minimum, maximum = [int(value) for value in range_spec]
+        step = int(per_dimension_steps.get(name, default_step))
+    elif len(range_spec) == 3:
+        minimum, maximum, step = [int(value) for value in range_spec]
+    else:
+        raise ValueError(
+            f"training_budget_ranges[{name!r}] must be [minimum, maximum] "
+            "or [minimum, maximum, step]"
+        )
+    if minimum < 1 or maximum < minimum:
+        raise ValueError(f"Invalid range for {name}: [{minimum}, {maximum}]")
+    if step < 1:
+        raise ValueError(f"training budget step for {name} must be >= 1")
+    values = integer_range_values(minimum, maximum, step)
+    if not values:
+        raise ValueError(
+            f"No training budget values for {name} with "
+            f"range [{minimum}, {maximum}] and step {step}"
+        )
+    return [minimum, maximum], values
+
+
 def resolve_budget_generalization_config(config):
     config = dict(config)
     budget_names = [
@@ -576,30 +605,14 @@ def resolve_budget_generalization_config(config):
         raise ValueError("Default rollout budgets must be >= 1")
 
     configured_ranges = config.get("training_budget_ranges")
-    if configured_ranges is None:
-        configured_ranges = {
-            name: [value, value]
-            for name, value in default_rollout_budgets.items()
-        }
-
-    resolved_ranges = {}
-    for name in budget_names:
-        if name not in configured_ranges or len(configured_ranges[name]) != 2:
-            raise ValueError(
-                f"training_budget_ranges[{name!r}] must contain [minimum, maximum]"
-            )
-        minimum, maximum = [int(value) for value in configured_ranges[name]]
-        if minimum < 1 or maximum < minimum:
-            raise ValueError(
-                f"Invalid range for {name}: [{minimum}, {maximum}]"
-            )
-        resolved_ranges[name] = [minimum, maximum]
-
     explicit_values = config.get("training_budget_values")
     default_step = int(config.get("training_budget_step", 1))
     if default_step < 1:
         raise ValueError("training_budget_step must be >= 1")
     per_dimension_steps = config.get("training_budget_steps", {})
+
+    resolved_ranges = {}
+    training_budget_values = {}
 
     if explicit_values is not None:
         if set(explicit_values) != set(budget_names):
@@ -607,7 +620,6 @@ def resolve_budget_generalization_config(config):
                 "training_budget_values must define acquisition_budget, "
                 "retrain_budget, and evaluation_budget"
             )
-        training_budget_values = {}
         for name in budget_names:
             values = sorted({int(value) for value in explicit_values[name]})
             if not values:
@@ -619,16 +631,24 @@ def resolve_budget_generalization_config(config):
             training_budget_values[name] = values
             resolved_ranges[name] = [values[0], values[-1]]
     else:
-        training_budget_values = {}
+        if configured_ranges is None:
+            configured_ranges = {
+                name: [value, value]
+                for name, value in default_rollout_budgets.items()
+            }
         for name in budget_names:
-            minimum, maximum = resolved_ranges[name]
-            step = int(per_dimension_steps.get(name, default_step))
-            values = integer_range_values(minimum, maximum, step)
-            if not values:
+            if name not in configured_ranges:
                 raise ValueError(
-                    f"No training budget values for {name} with "
-                    f"range [{minimum}, {maximum}] and step {step}"
+                    f"training_budget_ranges must define {name!r}, or provide "
+                    "training_budget_values for all three budgets"
                 )
+            resolved_range, values = resolve_training_budget_dimension(
+                name,
+                configured_ranges[name],
+                default_step,
+                per_dimension_steps,
+            )
+            resolved_ranges[name] = resolved_range
             training_budget_values[name] = values
 
     held_out = {
