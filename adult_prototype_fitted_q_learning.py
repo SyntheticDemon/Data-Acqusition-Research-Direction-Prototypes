@@ -198,13 +198,10 @@ def baseline_terminal_condition_key(config):
     )
 
 
-def baseline_terminal_introspection_score(experiment, config, baseline_name):
-    baseline_curves = baseline_policy_curves(experiment, config)
-    if baseline_name == "acquire_only":
-        baseline_curve = baseline_curves["acquire_only"]
-    else:
-        baseline_curve = baseline_curves["acquire_retrain"]
-    return float(baseline_curve["introspection_score"].iloc[-1])
+def baseline_terminal_score(experiment, config, baseline_name):
+    baseline_results = baseline_policy_curves(experiment, config)
+    model = baseline_results["final_models"][baseline_name]
+    return float(terminal_hidden_validation_score(model, experiment, config))
 
 
 def ensure_baseline_terminal_score(experiment, config, baseline_terminal_scores):
@@ -212,9 +209,7 @@ def ensure_baseline_terminal_score(experiment, config, baseline_terminal_scores)
     if condition_key in baseline_terminal_scores:
         return baseline_terminal_scores[condition_key]
     baseline_name = relative_terminal_reward_settings(config)["baseline"]
-    baseline_score = baseline_terminal_introspection_score(
-        experiment, config, baseline_name
-    )
+    baseline_score = baseline_terminal_score(experiment, config, baseline_name)
     baseline_terminal_scores[condition_key] = baseline_score
     return baseline_score
 
@@ -537,6 +532,20 @@ def resolve_batch_generalization_config(config):
     return config
 
 
+def integer_range_values(minimum, maximum, step):
+    minimum = int(minimum)
+    maximum = int(maximum)
+    step = int(step)
+    if step < 1:
+        raise ValueError("training budget step must be >= 1")
+    values = []
+    value = minimum
+    while value <= maximum:
+        values.append(value)
+        value += step
+    return values
+
+
 def resolve_budget_generalization_config(config):
     config = dict(config)
     budget_names = [
@@ -586,6 +595,42 @@ def resolve_budget_generalization_config(config):
             )
         resolved_ranges[name] = [minimum, maximum]
 
+    explicit_values = config.get("training_budget_values")
+    default_step = int(config.get("training_budget_step", 1))
+    if default_step < 1:
+        raise ValueError("training_budget_step must be >= 1")
+    per_dimension_steps = config.get("training_budget_steps", {})
+
+    if explicit_values is not None:
+        if set(explicit_values) != set(budget_names):
+            raise ValueError(
+                "training_budget_values must define acquisition_budget, "
+                "retrain_budget, and evaluation_budget"
+            )
+        training_budget_values = {}
+        for name in budget_names:
+            values = sorted({int(value) for value in explicit_values[name]})
+            if not values:
+                raise ValueError(f"training_budget_values[{name!r}] must not be empty")
+            if any(value < 1 for value in values):
+                raise ValueError(
+                    f"Each training_budget_values[{name!r}] entry must be >= 1"
+                )
+            training_budget_values[name] = values
+            resolved_ranges[name] = [values[0], values[-1]]
+    else:
+        training_budget_values = {}
+        for name in budget_names:
+            minimum, maximum = resolved_ranges[name]
+            step = int(per_dimension_steps.get(name, default_step))
+            values = integer_range_values(minimum, maximum, step)
+            if not values:
+                raise ValueError(
+                    f"No training budget values for {name} with "
+                    f"range [{minimum}, {maximum}] and step {step}"
+                )
+            training_budget_values[name] = values
+
     held_out = {
         tuple(int(value) for value in combination)
         for combination in held_out_config
@@ -595,25 +640,29 @@ def resolve_budget_generalization_config(config):
             "Each held-out budget combination must contain "
             "[acquisition, retrain, evaluation]"
         )
+    training_value_sets = {
+        name: set(training_budget_values[name]) for name in budget_names
+    }
     combination_count = int(np.prod(
-        [maximum - minimum + 1 for minimum, maximum in resolved_ranges.values()]
+        [len(training_budget_values[name]) for name in budget_names]
     ))
-    held_out_inside_training_ranges = sum(
+    held_out_inside_training_values = sum(
         all(
-            resolved_ranges[name][0] <= value <= resolved_ranges[name][1]
+            value in training_value_sets[name]
             for name, value in zip(budget_names, combination)
         )
         for combination in held_out
     )
-    if held_out_inside_training_ranges >= combination_count:
+    if held_out_inside_training_values >= combination_count:
         raise ValueError("Held-out combinations leave no budgets for training")
 
     config["training_budget_ranges"] = resolved_ranges
+    config["training_budget_values"] = training_budget_values
     config["held_out_budget_combinations"] = [list(values) for values in held_out]
     config["default_rollout_budgets"] = default_rollout_budgets
     config.update(default_rollout_budgets)
     config["training_budget_maxima"] = {
-        name: max(resolved_ranges[name][1], default_rollout_budgets[name])
+        name: max(max(training_budget_values[name]), default_rollout_budgets[name])
         for name in budget_names
     }
     return config
@@ -1608,10 +1657,10 @@ def baseline_policy_curves(experiment, config):
         }
     )
 
-    # Baseline 2: alternate Acquire -> Retrain while both budgets allow a pair.
-    # After the retrain budget is exhausted, keep acquiring with the last fitted
-    # model. If rows were acquired since the last retrain, apply one final
-    # retrain before Stop (same spirit as the acquire-only baseline).
+    # Baseline 2: alternate Acquire -> Train while both budgets allow a pair.
+    # After the train budget is exhausted, keep acquiring with the last fitted
+    # model. If rows were acquired since the last train and
+    # final_retrain_pending_rows is enabled, apply one final train before Stop.
     training_features = experiment["initial_train_features"].copy()
     training_targets = experiment["initial_train_targets"].copy()
     available_row_indices = np.arange(config["acquisition_pool_rows"], dtype=np.int64)
@@ -1788,7 +1837,10 @@ def baseline_policy_curves(experiment, config):
         config["acquisition_budget"] - remaining_acquisition_budget
     )
     retrain_cost_so_far = config["retrain_budget"] - remaining_retrain_budget
-    if not model_is_current and config["retrain_budget"] > 0:
+    if (
+        config.get("final_retrain_pending_rows", False)
+        and not model_is_current
+    ):
         acquire_retrain_final_retrain_progress = tqdm(
             total=1,
             desc="Baseline acquire→retrain: final retrain",
@@ -1826,6 +1878,10 @@ def baseline_policy_curves(experiment, config):
     return {
         "acquire_only": pd.DataFrame(acquire_only_records),
         "acquire_retrain": pd.DataFrame(acquire_retrain_records),
+        "final_models": {
+            "acquire_only": acquire_only_model,
+            "acquire_retrain": model,
+        },
     }
 
 
@@ -1894,16 +1950,17 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
         baseline_curves = baseline_policy_curves(experiment, benchmark_config)
         acquire_only_curve = baseline_curves["acquire_only"]
         acquire_retrain_curve = baseline_curves["acquire_retrain"]
-        acquire_retrain_comparison_curve = acquire_retrain_curve[
-            acquire_retrain_curve["action"].isin(
-                ["Initial", "Train", "TrainEvaluate", "FinalRetrain", "Stop"]
-            )
+        acquire_only_plot_curve = acquire_only_curve[
+            acquire_only_curve["action"] != "Stop"
+        ].copy()
+        acquire_retrain_plot_curve = acquire_retrain_curve[
+            acquire_retrain_curve["action"] != "Stop"
         ].copy()
         eval_set_label = eval_set.replace("_", " ")
         figure.add_trace(
             go.Scatter(
-                x=acquire_only_curve["acquisition_cost"],
-                y=acquire_only_curve["introspection_score"],
+                x=acquire_only_plot_curve["acquisition_cost"],
+                y=acquire_only_plot_curve["introspection_score"],
                 mode="lines+markers",
                 name=(
                     f"initial-model acquisition → final retrain: {eval_set_label} "
@@ -1911,13 +1968,13 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
                 ),
                 line={"width": 2, "dash": "dot", "color": "rgb(120, 120, 120)"},
                 marker={"size": 7, "symbol": "circle-open"},
-                customdata=acquire_only_curve[
+                customdata=acquire_only_plot_curve[
                     ["step", "action", "acquisition_cost", "retrain_cost"]
                 ].to_numpy(),
                 hovertemplate=(
                     "Acquisitions completed=%{x}<br>"
                     "baseline step=%{customdata[0]}<br>"
-                    f"batch acquisition {metric_label(introspection_metric)}=%{{y:.4f}}<br>"
+                    f"{metric_label(introspection_metric)}=%{{y:.4f}}<br>"
                     "action=%{customdata[1]}<br>"
                     "acquisition cost=%{customdata[2]}<br>"
                     "retrain cost=%{customdata[3]}<extra></extra>"
@@ -1928,22 +1985,22 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
         )
         figure.add_trace(
             go.Scatter(
-                x=acquire_retrain_comparison_curve["acquisition_cost"],
-                y=acquire_retrain_comparison_curve["introspection_score"],
+                x=acquire_retrain_plot_curve["acquisition_cost"],
+                y=acquire_retrain_plot_curve["introspection_score"],
                 mode="lines+markers",
                 name=(
-                    f"acquire → retrain baseline (after retrain): {eval_set_label} "
+                    f"acquire → retrain baseline: {eval_set_label} "
                     f"{metric_label(introspection_metric)}"
                 ),
                 line={"width": 2, "dash": "dash", "color": "rgb(31, 119, 180)"},
                 marker={"size": 7, "symbol": "triangle-up"},
-                customdata=acquire_retrain_comparison_curve[
+                customdata=acquire_retrain_plot_curve[
                     ["step", "action", "acquisition_cost", "retrain_cost"]
                 ].to_numpy(),
                 hovertemplate=(
                     "Acquisitions completed=%{x}<br>"
                     "baseline step=%{customdata[0]}<br>"
-                    f"acquire → retrain {metric_label(introspection_metric)}=%{{y:.4f}}<br>"
+                    f"{metric_label(introspection_metric)}=%{{y:.4f}}<br>"
                     "action=%{customdata[1]}<br>"
                     "acquisition cost=%{customdata[2]}<br>"
                     "retrain cost=%{customdata[3]}<extra></extra>"
@@ -2011,7 +2068,8 @@ def plot_episode_step_diagnostics(step_diagnostics, config, experiment=None):
         title=(
             "Final episode diagnostics "
             f"(target={metric_label(target_metric)}, policy={metric_label(policy_metric)}). "
-            "Top x-axis = acquisitions completed (baselines aligned after each retrain); "
+            "Top x-axis = acquisitions completed at each recorded step "
+            "(flat segments = model unchanged; jumps = retrain); "
             "bottom x-axis = episode step with action bands."
         ),
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.08, "x": 0},
@@ -2875,22 +2933,15 @@ def trim_replay_buffer(replay_buffer, config):
 
 
 def training_budget_combinations(config):
-    ranges = config["training_budget_ranges"]
+    budget_values = config["training_budget_values"]
     held_out = {
         tuple(combination)
         for combination in config.get("held_out_budget_combinations", [])
     }
     combinations = []
-    for acquisition_budget in range(
-        ranges["acquisition_budget"][0], ranges["acquisition_budget"][1] + 1
-    ):
-        for retrain_budget in range(
-            ranges["retrain_budget"][0], ranges["retrain_budget"][1] + 1
-        ):
-            for evaluation_budget in range(
-                ranges["evaluation_budget"][0],
-                ranges["evaluation_budget"][1] + 1,
-            ):
+    for acquisition_budget in budget_values["acquisition_budget"]:
+        for retrain_budget in budget_values["retrain_budget"]:
+            for evaluation_budget in budget_values["evaluation_budget"]:
                 values = (
                     acquisition_budget,
                     retrain_budget,

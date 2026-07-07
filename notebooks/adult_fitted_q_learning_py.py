@@ -77,6 +77,19 @@ config = {
         "retrain_budget": [1, 30],
         "evaluation_budget": [1, 30],
     },
+    # Step through each range (default step is 1 = every integer).
+    # "training_budget_step": 2,
+    # "training_budget_steps": {
+    #     "acquisition_budget": 2,
+    #     "retrain_budget": 1,
+    #     "evaluation_budget": 5,
+    # },
+    # Or pass explicit value lists instead of range + step:
+    # "training_budget_values": {
+    #     "acquisition_budget": [1, 5, 10, 20, 30],
+    #     "retrain_budget": [1, 4, 8, 12],
+    #     "evaluation_budget": [1, 6, 12, 18, 24, 30],
+    # },
     "default_rollout_budgets": {
         "acquisition_budget": 8,
         "retrain_budget": 4,
@@ -124,8 +137,9 @@ config = {
         "lambda_learning_rate_retrain": 0.25,
         "lambda_learning_rate_evaluation": 0.25,
     },
-    # Terminal reward = hidden-val F1 - baseline terminal F1 (same condition).
-    # Baseline curve uses introspection_metric / introspection_eval_set.
+    # Terminal reward = hidden-val target_metric - baseline terminal target_metric
+    # (same split/metric as episode terminal_score; baseline final model scored
+    # with terminal_hidden_validation_score).
     "relative_terminal_reward": {
         "enabled": True,
         "baseline": "acquire_retrain",  # or "acquire_only"
